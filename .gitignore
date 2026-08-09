@@ -1,0 +1,9 @@
+.vscode/
+.idea/
+__pycache__/
+*.py[co]
+log/
+output/
+data/list
+data/infrared_images
+checkpoints/

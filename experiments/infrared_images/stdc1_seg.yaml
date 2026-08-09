@@ -1,0 +1,66 @@
+CUDNN:
+  BENCHMARK: true
+  DETERMINISTIC: false
+  ENABLED: true
+GPUS: (0,)
+OUTPUT_DIR: 'output'
+LOG_DIR: 'log'
+WORKERS: 4
+PRINT_FREQ: 50
+
+DATASET:
+  DATASET: infrared_images
+  ROOT: 'data/'
+  TRAIN_SET: 'list/infrared_images/train.lst'      # 训练用
+  VAL_SET:   'list/infrared_images/val.lst'        # 训练过程中验证用
+  TEST_SET:  'list/infrared_images/evaluation.lst' # 评估/可视化用
+  NUM_CLASSES: 10
+  IGNORE_LABEL: 255
+  MEAN: [0.6423561, 0.1127488, 0.4362715]
+  STD:  [0.2345256, 0.1510579, 0.1994846]
+  CLASS_NAMES: ['_background_', 'BL_Device', 'CC_Server', 'DP_Server',
+                'KDVideo_Device', 'KVM_Switcher', 'SP_Cloud', 'VPN_Gateway',
+                'WEB_Firewall', 'YP_Server']
+
+MODEL:
+  BACKBONE: STDCNet813          # STDCNet813=STDC1, STDCNet1446=STDC2
+  PRETRAINED: "checkpoints/STDCNet813M_73.91.tar"
+  ALIGN_CORNERS: true
+  USE_CONV_LAST: false
+  USE_EMA: true
+  USE_BOUNDARY_2: false
+  USE_BOUNDARY_4: false
+  USE_BOUNDARY_8: true
+  USE_BOUNDARY_16: false
+
+LOSS:
+  SCORE_THRES: 0.7
+  USE_DETAIL_AGGREGATE: true    # DetailAggregateLoss (boundary)
+
+TRAIN:
+  IMAGE_SIZE:
+  - 640      # width (W)
+  - 640      # height (H)   -> cropsize = [640, 640]
+  BASE_SIZE: 640
+  RANDOM_SCALE: [0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 1.0, 1.125, 1.25, 1.375, 1.5]
+  BATCH_SIZE_PER_GPU: 12        # n_img_per_gpu (单卡即总 batch=12)
+  N_WORKERS_TRAIN: 4
+  N_WORKERS_VAL: 1
+  SHUFFLE: false                # DistributedSampler 已处理
+  # 3982 张训练图 / batch 12 = 331 iter/epoch; 200 epoch ≈ 66200 iter
+  MAX_ITER: 66200
+  SAVE_ITER_SEP: 3310           # 约每 10 epoch 评估并保存一次 (共 ~20 次)
+  WARMUP_STEPS: 1000
+  OPTIMIZER: sgd
+  LR: 0.01                      # lr_start
+  WD: 0.0005
+  MOMENTUM: 0.9
+  POWER: 0.9                    # poly lr 衰减指数
+  WARMUP_START_LR: 0.00001
+  RESPATH: 'output/infrared_images/stdc1_seg_640'
+
+EVAL:
+  BATCH_SIZE: 4
+  SCALE_50: 0.5                 # 对应 model_maxmIOU50.pth
+  SCALE_75: 1.0                # 640 训练时用 scale=1.0 评估更合适
+  MODEL_FILE: 'output/infrared_images/stdc1_seg_640/pths/model_maxmIOU75.pth'

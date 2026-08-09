@@ -4,6 +4,8 @@
 from logger import setup_logger
 from models.model_stages import BiSeNet
 from cityscapes import CityScapes
+from infrared_images import InfraredImages
+from config import config, update_config
 
 import torch
 import torch.nn as nn
@@ -16,8 +18,10 @@ import os.path as osp
 import logging
 import time
 import numpy as np
+from PIL import Image
 from tqdm import tqdm
 import math
+import argparse
 
 class MscEvalV0(object):
 
@@ -92,7 +96,7 @@ def evaluatev0(respth='./pretrained', dspth='./data', backbone='CatNetSmall', sc
 
     with torch.no_grad():
         single_scale = MscEvalV0(scale=scale)
-        mIOU = single_scale(net, dl, 19)
+        mIOU, ious, accs = single_scale(net, dl, 19)
     logger = logging.getLogger()
     logger.info('mIOU is: %s\n', mIOU)
 
@@ -254,28 +258,143 @@ def evaluate(respth='./resv1_catnet/pths/', dspth='./data'):
 
 
 
+def build_eval_dataset(cfg, cropsize):
+    name = cfg.DATASET.DATASET
+    list_path = cfg.DATASET.TEST_SET if cfg.DATASET.TEST_SET else cfg.DATASET.VAL_SET
+    if name == 'cityscapes':
+        return CityScapes(cfg.DATASET.ROOT, mode='val'), list_path
+    elif name == 'infrared_images':
+        ds = InfraredImages(cfg.DATASET.ROOT, list_path=list_path,
+                            cropsize=cropsize, mode='val',
+                            mean=tuple(cfg.DATASET.MEAN),
+                            std=tuple(cfg.DATASET.STD),
+                            ignore_lb=cfg.DATASET.IGNORE_LABEL)
+        return ds, list_path
+    else:
+        raise ValueError('Unsupported dataset: {}'.format(name))
+
+
+def evaluate_cfg(cfg):
+    """Config-driven evaluation entry.
+
+    - 默认读 DATASET.TEST_SET (evaluation.lst)
+    - 打印 MeanIU / Pixel_Acc / Mean_Acc / Class IoU
+    - 保存彩色 mask 到 output/<dataset>/evaluation_result/
+    """
+    logger = logging.getLogger()
+    logger.info('===='*20)
+    logger.info('evaluating the model ...')
+    logger.info(config)
+
+    cropsize = list(cfg.TRAIN.IMAGE_SIZE)  # [W, H]
+    dsval, list_path = build_eval_dataset(cfg, cropsize)
+    dl = DataLoader(dsval,
+                    batch_size = 1,                 # 保存 mask 需逐张处理
+                    shuffle = False,
+                    num_workers = cfg.WORKERS,
+                    drop_last = False)
+
+    n_classes = cfg.DATASET.NUM_CLASSES
+    ignore_label = cfg.DATASET.IGNORE_LABEL
+    net = BiSeNet(backbone=cfg.MODEL.BACKBONE, n_classes=n_classes,
+                  use_boundary_2=cfg.MODEL.USE_BOUNDARY_2,
+                  use_boundary_4=cfg.MODEL.USE_BOUNDARY_4,
+                  use_boundary_8=cfg.MODEL.USE_BOUNDARY_8,
+                  use_boundary_16=cfg.MODEL.USE_BOUNDARY_16,
+                  use_conv_last=cfg.MODEL.USE_CONV_LAST,
+                  use_ema=cfg.MODEL.USE_EMA)
+    net.load_state_dict(torch.load(cfg.EVAL.MODEL_FILE), strict=False)
+    net.cuda()
+    net.eval()
+
+    # 彩色 mask 保存目录: output/<dataset>/<set>_result
+    set_name = osp.splitext(osp.basename(list_path))[0]
+    sv_dir = osp.join(cfg.OUTPUT_DIR, cfg.DATASET.DATASET, set_name + '_result')
+    logger.info('saving colored masks to: %s', sv_dir)
+
+    # 类别名
+    class_names = list(cfg.DATASET.CLASS_NAMES) if len(cfg.DATASET.CLASS_NAMES) > 0 \
+        else ['cls{}'.format(i) for i in range(n_classes)]
+
+    hist = torch.zeros(n_classes, n_classes).cuda().detach()
+    scale = cfg.EVAL.SCALE_75
+    with torch.no_grad():
+        for idx, (imgs, label) in enumerate(tqdm(dl)):
+            name = dsval.names[idx]
+            label = label.squeeze(1).cuda()
+            size = label.size()[-2:]
+
+            imgs = imgs.cuda()
+            N, C, H, W = imgs.size()
+            new_hw = [int(H*scale), int(W*scale)]
+            in_imgs = F.interpolate(imgs, new_hw, mode='bilinear', align_corners=True) \
+                if scale != 1.0 else imgs
+
+            logits = net(in_imgs)[0]
+            logits = F.interpolate(logits, size=size, mode='bilinear', align_corners=True)
+            preds = torch.argmax(logits, dim=1)  # [N, H, W]
+
+            # 累加混淆矩阵
+            keep = label != ignore_label
+            hist += torch.bincount(
+                label[keep] * n_classes + preds[keep],
+                minlength=n_classes ** 2
+            ).view(n_classes, n_classes).float()
+
+            # 保存彩色 mask (resize 回原图尺寸)
+            pred_np = preds[0].cpu().numpy().astype(np.uint8)
+            if hasattr(dsval, 'save_pred'):
+                orig_w, orig_h = Image.open(dsval.imgs[idx]).size
+                if (orig_h, orig_w) != size:
+                    pred_pil = Image.fromarray(pred_np).resize(
+                        (orig_w, orig_h), Image.NEAREST)
+                    pred_np = np.array(pred_pil).astype(np.uint8)
+                dsval.save_pred(pred_np, sv_dir, name)
+
+            if idx % 100 == 0:
+                pos = hist.sum(1); res = hist.sum(0); tp = hist.diag()
+                iou_arr = tp / torch.clamp(pos + res - tp, min=1.0)
+                logger.info('processing: %d images, running mIoU: %.4f',
+                             idx, float(iou_arr.mean()))
+
+    # 最终指标
+    pos = hist.sum(1); res = hist.sum(0); tp = hist.diag()
+    pixel_acc = float(tp.sum() / torch.clamp(pos.sum(), min=1.0))
+    mean_acc = float((tp / torch.clamp(pos, min=1.0)).mean())
+    iou_arr = tp / torch.clamp(pos + res - tp, min=1.0)
+    mean_iou = float(iou_arr.mean())
+
+    msg = 'MeanIU: {: 4.4f}, Pixel_Acc: {: 4.4f}, Mean_Acc: {: 4.4f}, Class IoU: '.format(
+        mean_iou, pixel_acc, mean_acc)
+    logger.info(msg)
+    iou_list = ['{:.4f}'.format(float(x)) for x in iou_arr.cpu().numpy()]
+    logger.info('  '.join(iou_list))
+    # 逐类带名字
+    logger.info('per-class:')
+    for ci, cname in enumerate(class_names):
+        logger.info('  {:3d} {:<15s} IoU={:.4f} Acc={:.4f}'.format(
+            ci, cname, float(iou_arr[ci]),
+            float(tp[ci] / torch.clamp(pos[ci], min=1.0))))
+
+
+def parse_eval_args():
+    parse = argparse.ArgumentParser(description='Evaluate STDC-Seg')
+    parse.add_argument('--cfg', dest='cfg', type=str,
+                       default='experiments/infrared_images/stdc1_seg.yaml',
+                       help='experiment configure file name')
+    parse.add_argument('opts', help='Modify config options using the command-line',
+                       default=None, nargs=argparse.REMAINDER)
+    args = parse.parse_args()
+    update_config(config, args)
+    return args
+
+
 if __name__ == "__main__":
-    log_dir = 'evaluation_logs/'
-    if not os.path.exists(log_dir):
+    args = parse_eval_args()
+    # 日志放到 TRAIN.RESPATH (如 output/infrared_images/stdc1_seg_640/)
+    log_dir = config.TRAIN.RESPATH if config.TRAIN.RESPATH else config.OUTPUT_DIR
+    if not osp.exists(log_dir):
         os.makedirs(log_dir)
     setup_logger(log_dir)
-    
-    #STDC1-Seg50 mIoU 0.7222
-    # evaluatev0('./checkpoints/STDC1-Seg/model_maxmIOU50.pth', dspth='./data', backbone='STDCNet813', scale=0.5, 
-    # use_boundary_2=False, use_boundary_4=False, use_boundary_8=True, use_boundary_16=False)
-
-    #STDC1-Seg75 mIoU 0.7450
-    # evaluatev0('./checkpoints/STDC1-Seg/model_maxmIOU75.pth', dspth='./data', backbone='STDCNet813', scale=0.75, 
-    # use_boundary_2=False, use_boundary_4=False, use_boundary_8=True, use_boundary_16=False)
-
-
-    #STDC2-Seg50 mIoU 0.7424
-    # evaluatev0('./checkpoints/STDC2-Seg/model_maxmIOU50.pth', dspth='./data', backbone='STDCNet1446', scale=0.5, 
-    # use_boundary_2=False, use_boundary_4=False, use_boundary_8=True, use_boundary_16=False)
-
-    #STDC2-Seg75 mIoU 0.7704
-    evaluatev0('./checkpoints/STDC2-Seg/model_maxmIOU75.pth', dspth='./data', backbone='STDCNet1446', scale=0.75, 
-    use_boundary_2=False, use_boundary_4=False, use_boundary_8=True, use_boundary_16=False)
-
-   
+    evaluate_cfg(config)
 

@@ -3,10 +3,12 @@
 from logger import setup_logger
 from models.model_stages import BiSeNet
 from cityscapes import CityScapes
+from infrared_images import InfraredImages
 from loss.loss import OhemCELoss
 from loss.detail_loss import DetailAggregateLoss
 from evaluation import MscEvalV0
 from optimizer_loss import Optimizer
+from config import config, update_config
 
 import torch
 import torch.nn as nn
@@ -33,9 +35,16 @@ def str2bool(v):
 
 
 def parse_args():
-    parse = argparse.ArgumentParser()
+    parse = argparse.ArgumentParser(description='Train STDC-Seg')
     parse.add_argument(
-            '--local_rank',
+            '--cfg',
+            dest = 'cfg',
+            type = str,
+            default = None,
+            help = 'experiment configure file name, e.g. experiments/infrared_images/stdc1_seg.yaml',
+            )
+    parse.add_argument(
+            '--local_rank', '--local-rank',
             dest = 'local_rank',
             type = int,
             default = -1,
@@ -44,43 +53,43 @@ def parse_args():
             '--n_workers_train',
             dest = 'n_workers_train',
             type = int,
-            default = 8,
+            default = None,
             )
     parse.add_argument(
             '--n_workers_val',
             dest = 'n_workers_val',
             type = int,
-            default = 0,
+            default = None,
             )
     parse.add_argument(
             '--n_img_per_gpu',
             dest = 'n_img_per_gpu',
             type = int,
-            default = 16,
+            default = None,
             )
     parse.add_argument(
             '--max_iter',
             dest = 'max_iter',
             type = int,
-            default = 40000,
+            default = None,
             )
     parse.add_argument(
             '--save_iter_sep',
             dest = 'save_iter_sep',
             type = int,
-            default = 1000,
+            default = None,
             )
     parse.add_argument(
             '--warmup_steps',
             dest = 'warmup_steps',
             type = int,
-            default = 1000,
-            )      
+            default = None,
+            )
     parse.add_argument(
             '--mode',
             dest = 'mode',
             type = str,
-            default = 'train',
+            default = None,
             )
     parse.add_argument(
             '--ckpt',
@@ -98,94 +107,138 @@ def parse_args():
             '--backbone',
             dest = 'backbone',
             type = str,
-            default = 'CatNetSmall',
+            default = None,
             )
     parse.add_argument(
             '--pretrain_path',
             dest = 'pretrain_path',
             type = str,
-            default = '',
+            default = None,
             )
     parse.add_argument(
             '--use_conv_last',
             dest = 'use_conv_last',
             type = str2bool,
-            default = False,
+            default = None,
             )
     parse.add_argument(
             '--use_boundary_2',
             dest = 'use_boundary_2',
             type = str2bool,
-            default = False,
+            default = None,
             )
     parse.add_argument(
             '--use_boundary_4',
             dest = 'use_boundary_4',
             type = str2bool,
-            default = False,
+            default = None,
             )
     parse.add_argument(
             '--use_boundary_8',
             dest = 'use_boundary_8',
             type = str2bool,
-            default = False,
+            default = None,
             )
     parse.add_argument(
             '--use_boundary_16',
             dest = 'use_boundary_16',
             type = str2bool,
-            default = False,
+            default = None,
             )
-    return parse.parse_args()
+    parse.add_argument(
+            'opts',
+            help = "Modify config options using the command-line, e.g. TRAIN.MAX_ITER 40000",
+            default = None,
+            nargs = argparse.REMAINDER,
+            )
+    args = parse.parse_args()
+    update_config(config, args)
+    return args
+
+
+def build_dataset(cfg, mode, cropsize, randomscale):
+    name = cfg.DATASET.DATASET
+    if name == 'cityscapes':
+        return CityScapes(cfg.DATASET.ROOT, cropsize=cropsize, mode=mode,
+                          randomscale=randomscale)
+    elif name == 'infrared_images':
+        list_path = cfg.DATASET.TRAIN_SET if mode in ('train', 'trainval') else cfg.DATASET.VAL_SET
+        return InfraredImages(cfg.DATASET.ROOT, list_path=list_path,
+                              cropsize=cropsize, mode=mode,
+                              randomscale=randomscale,
+                              mean=tuple(cfg.DATASET.MEAN),
+                              std=tuple(cfg.DATASET.STD),
+                              ignore_lb=cfg.DATASET.IGNORE_LABEL)
+    else:
+        raise ValueError('Unsupported dataset: {}'.format(name))
 
 
 def train():
     args = parse_args()
-    
-    save_pth_path = os.path.join(args.respath, 'pths')
-    dspth = './data'
-    
+
+    # Resolve effective values: CLI args override config, else use config.
+    respath = args.respath if args.respath is not None else config.TRAIN.RESPATH
+    save_pth_path = os.path.join(respath, 'pths')
+
     # print(save_pth_path)
     # print(osp.exists(save_pth_path))
-    # if not osp.exists(save_pth_path) and dist.get_rank()==0: 
+    # if not osp.exists(save_pth_path) and dist.get_rank()==0:
     if not osp.exists(save_pth_path):
         os.makedirs(save_pth_path)
-    
-    
-    torch.cuda.set_device(args.local_rank)
-    dist.init_process_group(
-                backend = 'nccl',
-                init_method = 'tcp://127.0.0.1:33274',
-                world_size = torch.cuda.device_count(),
-                rank=args.local_rank
-                )
-    
-    setup_logger(args.respath)
-    ## dataset
-    n_classes = 19
-    n_img_per_gpu = args.n_img_per_gpu
-    n_workers_train = args.n_workers_train
-    n_workers_val = args.n_workers_val
-    use_boundary_16 = args.use_boundary_16
-    use_boundary_8 = args.use_boundary_8
-    use_boundary_4 = args.use_boundary_4
-    use_boundary_2 = args.use_boundary_2
-    
-    mode = args.mode
-    cropsize = [1024, 512]
-    randomscale = (0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 1.0, 1.125, 1.25, 1.375, 1.5)
 
-    if dist.get_rank()==0: 
+
+    torch.cuda.set_device(args.local_rank)
+    # 用 env:// 初始化更稳: torch.distributed.launch / torchrun 会自动设
+    # MASTER_ADDR / MASTER_PORT / WORLD_SIZE / RANK 环境变量。
+    # 单卡时若未走 launcher (直接 python train.py), 用 env 兜底为单进程。
+    if not dist.is_initialized():
+        if 'WORLD_SIZE' not in os.environ:
+            os.environ['MASTER_ADDR'] = '127.0.0.1'
+            os.environ['MASTER_PORT'] = '29500'
+            os.environ['WORLD_SIZE'] = str(torch.cuda.device_count())
+            os.environ['RANK'] = '0'
+        dist.init_process_group(
+                    backend='nccl',
+                    init_method='env://',
+                    )
+
+    setup_logger(respath)
+    if dist.get_rank()==0:
+        logger.info('===='*20)
+        logger.info('cfg file: {}'.format(args.cfg))
+        logger.info(config)
+    ## dataset
+    n_classes = config.DATASET.NUM_CLASSES
+    n_img_per_gpu = args.n_img_per_gpu if args.n_img_per_gpu is not None else config.TRAIN.BATCH_SIZE_PER_GPU
+    n_workers_train = args.n_workers_train if args.n_workers_train is not None else config.TRAIN.N_WORKERS_TRAIN
+    n_workers_val = args.n_workers_val if args.n_workers_val is not None else config.TRAIN.N_WORKERS_VAL
+    use_boundary_16 = args.use_boundary_16 if args.use_boundary_16 is not None else config.MODEL.USE_BOUNDARY_16
+    use_boundary_8 = args.use_boundary_8 if args.use_boundary_8 is not None else config.MODEL.USE_BOUNDARY_8
+    use_boundary_4 = args.use_boundary_4 if args.use_boundary_4 is not None else config.MODEL.USE_BOUNDARY_4
+    use_boundary_2 = args.use_boundary_2 if args.use_boundary_2 is not None else config.MODEL.USE_BOUNDARY_2
+    use_conv_last = args.use_conv_last if args.use_conv_last is not None else config.MODEL.USE_CONV_LAST
+    use_ema = config.MODEL.USE_EMA
+    backbone = args.backbone if args.backbone is not None else config.MODEL.BACKBONE
+    pretrain_path = args.pretrain_path if args.pretrain_path is not None else config.MODEL.PRETRAINED
+    mode = args.mode if args.mode is not None else 'train'
+
+    cropsize = list(config.TRAIN.IMAGE_SIZE)  # [W, H]
+    randomscale = tuple(config.TRAIN.RANDOM_SCALE)
+
+    if dist.get_rank()==0:
         logger.info('n_workers_train: {}'.format(n_workers_train))
         logger.info('n_workers_val: {}'.format(n_workers_val))
         logger.info('use_boundary_2: {}'.format(use_boundary_2))
         logger.info('use_boundary_4: {}'.format(use_boundary_4))
         logger.info('use_boundary_8: {}'.format(use_boundary_8))
         logger.info('use_boundary_16: {}'.format(use_boundary_16))
-        logger.info('mode: {}'.format(args.mode))
-    
-    
-    ds = CityScapes(dspth, cropsize=cropsize, mode=mode, randomscale=randomscale)
+        logger.info('mode: {}'.format(mode))
+        logger.info('backbone: {}'.format(backbone))
+        logger.info('n_classes: {}'.format(n_classes))
+        logger.info('cropsize: {}'.format(cropsize))
+
+
+    ds = build_dataset(config, mode, cropsize, randomscale)
     sampler = torch.utils.data.distributed.DistributedSampler(ds)
     dl = DataLoader(ds,
                     batch_size = n_img_per_gpu,
@@ -195,20 +248,20 @@ def train():
                     pin_memory = False,
                     drop_last = True)
     # exit(0)
-    dsval = CityScapes(dspth, mode='val', randomscale=randomscale)
+    dsval = build_dataset(config, 'val', cropsize, randomscale)
     sampler_val = torch.utils.data.distributed.DistributedSampler(dsval)
     dlval = DataLoader(dsval,
-                    batch_size = 2,
+                    batch_size = config.EVAL.BATCH_SIZE,
                     shuffle = False,
                     sampler = sampler_val,
                     num_workers = n_workers_val,
                     drop_last = False)
 
     ## model
-    ignore_idx = 255
-    net = BiSeNet(backbone=args.backbone, n_classes=n_classes, pretrain_model=args.pretrain_path, 
-    use_boundary_2=use_boundary_2, use_boundary_4=use_boundary_4, use_boundary_8=use_boundary_8, 
-    use_boundary_16=use_boundary_16, use_conv_last=args.use_conv_last)
+    ignore_idx = config.DATASET.IGNORE_LABEL
+    net = BiSeNet(backbone=backbone, n_classes=n_classes, pretrain_model=pretrain_path,
+    use_boundary_2=use_boundary_2, use_boundary_4=use_boundary_4, use_boundary_8=use_boundary_8,
+    use_boundary_16=use_boundary_16, use_conv_last=use_conv_last, use_ema=use_ema)
 
     if not args.ckpt is None:
         net.load_state_dict(torch.load(args.ckpt, map_location='cpu'))
@@ -220,7 +273,7 @@ def train():
             find_unused_parameters=True
             )
 
-    score_thres = 0.7
+    score_thres = config.LOSS.SCORE_THRES
     n_min = n_img_per_gpu*cropsize[0]*cropsize[1]//16
     criteria_p = OhemCELoss(thresh=score_thres, n_min=n_min, ignore_lb=ignore_idx)
     criteria_16 = OhemCELoss(thresh=score_thres, n_min=n_min, ignore_lb=ignore_idx)
@@ -229,14 +282,14 @@ def train():
     ## optimizer
     maxmIOU50 = 0.
     maxmIOU75 = 0.
-    momentum = 0.9
-    weight_decay = 5e-4
-    lr_start = 1e-2
-    max_iter = args.max_iter
-    save_iter_sep = args.save_iter_sep
-    power = 0.9
-    warmup_steps = args.warmup_steps
-    warmup_start_lr = 1e-5
+    momentum = config.TRAIN.MOMENTUM
+    weight_decay = config.TRAIN.WD
+    lr_start = config.TRAIN.LR
+    max_iter = args.max_iter if args.max_iter is not None else config.TRAIN.MAX_ITER
+    save_iter_sep = args.save_iter_sep if args.save_iter_sep is not None else config.TRAIN.SAVE_ITER_SEP
+    power = config.TRAIN.POWER
+    warmup_steps = args.warmup_steps if args.warmup_steps is not None else config.TRAIN.WARMUP_STEPS
+    warmup_start_lr = config.TRAIN.WARMUP_START_LR
 
     if dist.get_rank()==0: 
         print('max_iter: ', max_iter)
@@ -254,7 +307,7 @@ def train():
             power = power)
     
     ## train loop
-    msg_iter = 50
+    msg_iter = config.PRINT_FREQ
     loss_avg = []
     loss_boundery_bce = []
     loss_boundery_dice = []
@@ -379,7 +432,7 @@ def train():
                 single_scale1 = MscEvalV0()
                 mIOU50 = single_scale1(net, dlval, n_classes)
 
-                single_scale2= MscEvalV0(scale=0.75)
+                single_scale2= MscEvalV0(scale=config.EVAL.SCALE_75)
                 mIOU75 = single_scale2(net, dlval, n_classes)
 
 

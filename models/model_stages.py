@@ -9,8 +9,9 @@ import torchvision
 
 
 from nets.stdcnet import STDCNet1446, STDCNet813
-from modules.bn import InPlaceABNSync as BatchNorm2d
-# BatchNorm2d = nn.BatchNorm2d
+# 用普通 BN, 避免 inplace_abn 在新版 PyTorch 上 "dirty not returned" 报错。
+# 如需 InPlaceABN, 改回: from modules.bn import InPlaceABNSync as BatchNorm2d
+BatchNorm2d = nn.BatchNorm2d
 
 class ConvBNReLU(nn.Module):
     def __init__(self, in_chan, out_chan, ks=3, stride=1, padding=1, *args, **kwargs):
@@ -21,8 +22,8 @@ class ConvBNReLU(nn.Module):
                 stride = stride,
                 padding = padding,
                 bias = False)
-        # self.bn = BatchNorm2d(out_chan)
-        self.bn = BatchNorm2d(out_chan, activation='none')
+        # 普通 nn.BatchNorm2d 不接受 activation 参数 (那是 InPlaceABN 专有的)。
+        self.bn = BatchNorm2d(out_chan)
         self.relu = nn.ReLU()
         self.init_weight()
 
@@ -74,8 +75,8 @@ class AttentionRefinementModule(nn.Module):
         super(AttentionRefinementModule, self).__init__()
         self.conv = ConvBNReLU(in_chan, out_chan, ks=3, stride=1, padding=1)
         self.conv_atten = nn.Conv2d(out_chan, out_chan, kernel_size= 1, bias=False)
-        # self.bn_atten = BatchNorm2d(out_chan)
-        self.bn_atten = BatchNorm2d(out_chan, activation='none')
+        # 普通 nn.BatchNorm2d 不接受 activation 参数。
+        self.bn_atten = BatchNorm2d(out_chan)
 
         self.sigmoid_atten = nn.Sigmoid()
         self.init_weight()
@@ -97,12 +98,12 @@ class AttentionRefinementModule(nn.Module):
 
 
 class ContextPath(nn.Module):
-    def __init__(self, backbone='CatNetSmall', pretrain_model='', use_conv_last=False, *args, **kwargs):
+    def __init__(self, backbone='CatNetSmall', pretrain_model='', use_conv_last=False, use_ema=False, *args, **kwargs):
         super(ContextPath, self).__init__()
-        
+
         self.backbone_name = backbone
         if backbone == 'STDCNet1446':
-            self.backbone = STDCNet1446(pretrain_model=pretrain_model, use_conv_last=use_conv_last)
+            self.backbone = STDCNet1446(pretrain_model=pretrain_model, use_conv_last=use_conv_last, use_ema=use_ema)
             self.arm16 = AttentionRefinementModule(512, 128)
             inplanes = 1024
             if use_conv_last:
@@ -113,7 +114,7 @@ class ContextPath(nn.Module):
             self.conv_avg = ConvBNReLU(inplanes, 128, ks=1, stride=1, padding=0)
 
         elif backbone == 'STDCNet813':
-            self.backbone = STDCNet813(pretrain_model=pretrain_model, use_conv_last=use_conv_last)
+            self.backbone = STDCNet813(pretrain_model=pretrain_model, use_conv_last=use_conv_last, use_ema=use_ema)
             self.arm16 = AttentionRefinementModule(512, 128)
             inplanes = 1024
             if use_conv_last:
@@ -222,15 +223,15 @@ class FeatureFusionModule(nn.Module):
 
 
 class BiSeNet(nn.Module):
-    def __init__(self, backbone, n_classes, pretrain_model='', use_boundary_2=False, use_boundary_4=False, use_boundary_8=False, use_boundary_16=False, use_conv_last=False, heat_map=False, *args, **kwargs):
+    def __init__(self, backbone, n_classes, pretrain_model='', use_boundary_2=False, use_boundary_4=False, use_boundary_8=False, use_boundary_16=False, use_conv_last=False, use_ema=False, heat_map=False, *args, **kwargs):
         super(BiSeNet, self).__init__()
-        
+
         self.use_boundary_2 = use_boundary_2
         self.use_boundary_4 = use_boundary_4
         self.use_boundary_8 = use_boundary_8
         self.use_boundary_16 = use_boundary_16
         # self.heat_map = heat_map
-        self.cp = ContextPath(backbone, pretrain_model, use_conv_last=use_conv_last)
+        self.cp = ContextPath(backbone, pretrain_model, use_conv_last=use_conv_last, use_ema=use_ema)
         
         
         
