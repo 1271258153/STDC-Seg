@@ -19,3 +19,8 @@ python evaluation.py
 python comparison.py
 ```
 > 在 `output/infrared_images/comparison_images` 下生成四格对比图
+
+### 获取参数量和FPS
+```bash
+python get_fps_and_pm.py --device cuda
+```
