@@ -1,11 +1,21 @@
 #!/usr/bin/python
 # -*- encoding: utf-8 -*-
-"""生成横向四联对比图: 原图 | 真值 | 预测 | 叠加
+"""生成预测可视化图。
 
 用法:
     python comparison.py
     python comparison.py --cfg experiments/infrared_images/stdc1_seg.yaml
     python comparison.py --cfg <yaml> EVAL.MODEL_FILE <path_to_pth>
+    python comparison.py --overlay-only
+    python comparison.py --input-dir path/to/images --output-dir path/to/results
+    python comparison.py --input-dir path/to/images --image example.png
+    python comparison.py --overlay-only --image example.png
+    python comparison.py --overlay-only --images example1.png,example2.png
+
+``--image`` / ``--images`` 可重复使用，也可传入逗号分隔的文件名。
+``--input-dir`` 会读取目录中的常见图片文件并自动只生成叠加图。
+``--output-dir`` 用于直接指定结果保存目录。
+文件名可以带路径或扩展名，实际会按数据集中的文件名（不含扩展名）匹配。
 
 输出:
     output/infrared_images/comparison_images/<name>.png
@@ -17,7 +27,7 @@ from infrared_images import InfraredImages
 from config import config, update_config
 
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset, Subset
 import torch.nn.functional as F
 
 import os
@@ -46,6 +56,50 @@ def build_eval_dataset(cfg, cropsize):
     return ds, list_path
 
 
+IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff'}
+
+
+class ImageDirectoryDataset(Dataset):
+    """从指定目录读取无标注图片，用于生成预测叠加图。"""
+
+    def __init__(self, input_dir, cropsize, mean, std, ignore_label):
+        input_dir = osp.abspath(osp.expanduser(input_dir))
+        if not osp.isdir(input_dir):
+            raise ValueError('输入目录不存在或不是目录: {}'.format(input_dir))
+
+        entries = sorted(os.scandir(input_dir), key=lambda entry: entry.name)
+        self.imgs = [
+            entry.path for entry in entries
+            if entry.is_file() and osp.splitext(entry.name)[1].lower() in IMAGE_EXTENSIONS
+        ]
+        if not self.imgs:
+            raise ValueError('输入目录中没有支持的图片: {}'.format(input_dir))
+
+        self.names = [osp.splitext(osp.basename(path))[0] for path in self.imgs]
+        self.cropsize = cropsize
+        self.ignore_label = ignore_label
+        self.mean = torch.tensor(mean, dtype=torch.float32).view(3, 1, 1)
+        self.std = torch.tensor(std, dtype=torch.float32).view(3, 1, 1)
+
+    def __getitem__(self, idx):
+        img = Image.open(self.imgs[idx]).convert('RGB')
+        width, height = self.cropsize
+        img = img.resize((width, height), Image.BILINEAR)
+        img = np.array(img, dtype=np.float32).transpose(2, 0, 1) / 255.0
+        img = torch.from_numpy(img)
+        img = (img - self.mean) / self.std
+        label = np.full((1, height, width), self.ignore_label, dtype=np.int64)
+        return img, label
+
+    def __len__(self):
+        return len(self.imgs)
+
+    def label2color(self, label):
+        color_map = np.zeros(label.shape + (3,), dtype=np.uint8)
+        for class_id, color in enumerate(InfraredImages.COLOR_LIST):
+            color_map[label == class_id] = color
+        return color_map
+
 def denormalize(img_t, mean, std):
     """[3,H,W] normalized tensor -> [H,W,3] uint8 (RGB)"""
     mean = np.array(mean, dtype=np.float32).reshape(3, 1, 1)
@@ -63,16 +117,66 @@ def overlay(img_rgb, color_mask, alpha=0.5):
     return np.clip(out, 0, 255).astype(np.uint8)
 
 
-def make_comparison(cfg):
+def normalize_image_names(images):
+    """把命令行中的图片路径/文件名转成不带扩展名的文件名。"""
+    if not images:
+        return []
+
+    names = []
+    for value in images:
+        for item in value.split(','):
+            item = item.strip()
+            if item:
+                names.append(osp.splitext(osp.basename(item))[0])
+    # 去重但保留用户指定的顺序
+    return list(dict.fromkeys(names))
+
+
+def select_image_indices(dataset, images):
+    """返回指定图片在数据集中的下标；未指定时返回全部下标。"""
+    requested = normalize_image_names(images)
+    if not requested:
+        return list(range(len(dataset)))
+
+    indices_by_name = {}
+    for idx, name in enumerate(dataset.names):
+        indices_by_name.setdefault(name, []).append(idx)
+
+    missing = [name for name in requested if name not in indices_by_name]
+    if missing:
+        examples = ', '.join(dataset.names[:10])
+        raise ValueError(
+            '在输入数据中找不到图片: {}. 可用名称示例: {}'.format(
+                ', '.join(missing), examples or '<empty dataset>'))
+
+    return [idx for name in requested for idx in indices_by_name[name]]
+
+
+def make_comparison(cfg, overlay_only=False, images=None, input_dir=None, output_dir=None):
     logger = logging.getLogger()
     logger.info('=' * 20)
     logger.info('generating comparison images ...')
     logger.info(config)
 
     cropsize = list(cfg.TRAIN.IMAGE_SIZE)  # [W, H]
-    dsval, list_path = build_eval_dataset(cfg, cropsize)
-    dl = DataLoader(dsval, batch_size=1, shuffle=False,
+    if input_dir:
+        dsval = ImageDirectoryDataset(
+            input_dir, cropsize,
+            tuple(cfg.DATASET.MEAN),
+            tuple(cfg.DATASET.STD),
+            cfg.DATASET.IGNORE_LABEL)
+        if not overlay_only:
+            logger.info('--input-dir has no labels; enabling overlay-only mode')
+        overlay_only = True
+    else:
+        dsval, _ = build_eval_dataset(cfg, cropsize)
+    selected_indices = select_image_indices(dsval, images)
+    selected_ds = Subset(dsval, selected_indices)
+    dl = DataLoader(selected_ds, batch_size=1, shuffle=False,
                     num_workers=cfg.WORKERS, drop_last=False)
+    if images:
+        logger.info('selected %d image(s): %s', len(selected_indices),
+                    ', '.join(dsval.names[idx] for idx in selected_indices))
 
     n_classes = cfg.DATASET.NUM_CLASSES
     net = BiSeNet(backbone=cfg.MODEL.BACKBONE, n_classes=n_classes,
@@ -86,7 +190,8 @@ def make_comparison(cfg):
     net.cuda()
     net.eval()
 
-    sv_dir = osp.join(cfg.OUTPUT_DIR, cfg.DATASET.DATASET, 'comparison_images')
+    sv_dir = (osp.abspath(osp.expanduser(output_dir)) if output_dir else
+              osp.join(cfg.OUTPUT_DIR, cfg.DATASET.DATASET, 'comparison_images'))
     os.makedirs(sv_dir, exist_ok=True)
     logger.info('saving comparison images to: %s', sv_dir)
 
@@ -96,7 +201,8 @@ def make_comparison(cfg):
     ignore_label = cfg.DATASET.IGNORE_LABEL
 
     with torch.no_grad():
-        for idx, (imgs, label) in enumerate(tqdm(dl, desc='comparison')):
+        for batch_idx, (imgs, label) in enumerate(tqdm(dl, desc='comparison')):
+            idx = selected_indices[batch_idx]
             name = dsval.names[idx]
             label = label.squeeze(1).cuda()
             size = label.size()[-2:]  # [H, W] (cropsize)
@@ -125,31 +231,49 @@ def make_comparison(cfg):
                 pred = np.array(Image.fromarray(pred).resize(
                     (orig_w, orig_h), Image.NEAREST)).astype(np.uint8)
 
-            lb_color = dsval.label2color(lb_np)
+            lb_color = None
+            if not overlay_only:
+                lb_color = dsval.label2color(lb_np)
             pred_color = dsval.label2color(pred)
             overlaid = overlay(img_rgb, pred_color, alpha=0.5)
 
-            # 拼成 1x4 横向连接
-            fig, axes = plt.subplots(1, 4, figsize=(48, 12))
-            titles = ['Image', 'Ground Truth', 'Prediction', 'Overlay']
-            images = [img_rgb, lb_color, pred_color, overlaid]
-            for ax, im, t in zip(axes, images, titles):
-                ax.imshow(im)
-                ax.set_title(t, fontsize=20)
-                ax.axis('off')
-            plt.tight_layout()
             out_path = osp.join(sv_dir, name + '.png')
-            plt.savefig(out_path, dpi=120, bbox_inches='tight')
-            plt.close(fig)
+            if overlay_only:
+                # 保存原始分辨率的纯叠加图，不添加标题或留白。
+                Image.fromarray(overlaid).save(out_path)
+            else:
+                # 拼成 1x4 横向连接
+                fig, axes = plt.subplots(1, 4, figsize=(48, 12))
+                titles = ['Image', 'Ground Truth', 'Prediction', 'Overlay']
+                comparison_images = [img_rgb, lb_color, pred_color, overlaid]
+                for ax, im, title in zip(axes, comparison_images, titles):
+                    ax.imshow(im)
+                    ax.set_title(title, fontsize=20)
+                    ax.axis('off')
+                plt.tight_layout()
+                plt.savefig(out_path, dpi=120, bbox_inches='tight')
+                plt.close(fig)
 
-    logger.info('done. %d comparison images saved to %s', len(dsval), sv_dir)
+    image_type = 'overlay' if overlay_only else 'comparison'
+    logger.info('done. %d %s image(s) saved to %s',
+                len(selected_indices), image_type, sv_dir)
 
 
 def parse_args():
-    parse = argparse.ArgumentParser(description='Generate 1x4 horizontal comparison images')
+    parse = argparse.ArgumentParser(description='Generate prediction visualization images')
     parse.add_argument('--cfg', dest='cfg', type=str,
                        default='experiments/infrared_images/stdc1_seg.yaml',
                        help='experiment configure file name')
+    parse.add_argument('--overlay-only', action='store_true',
+                       help='save only the prediction overlay at the original resolution')
+    parse.add_argument('--input-dir', type=str,
+                       help='read input images from this directory')
+    parse.add_argument('--output-dir', type=str,
+                       help='save generated images directly to this directory')
+    parse.add_argument('--image', '--images', dest='images', action='append',
+                       metavar='IMAGE',
+                       help=('only process this image; repeat the option or use a '
+                             'comma-separated list for multiple images'))
     parse.add_argument('opts', help='Modify config options using the command-line',
                        default=None, nargs=argparse.REMAINDER)
     args = parse.parse_args()
@@ -163,4 +287,8 @@ if __name__ == '__main__':
     if not osp.exists(log_dir):
         os.makedirs(log_dir)
     setup_logger(log_dir)
-    make_comparison(config)
+    make_comparison(config,
+                    overlay_only=args.overlay_only,
+                    images=args.images,
+                    input_dir=args.input_dir,
+                    output_dir=args.output_dir)
