@@ -20,12 +20,14 @@ python comparison.py
 ```
 > 在 `output/infrared_images/comparison_images` 下生成四格对比图
 
-```bash
+```
 # 只生成叠加图
 python comparison.py \
   --input-dir data/infrared_images/images/test \
+  --mask-dir output/infrared_images/evaluation_result \
   --output-dir output/infrared_images/overlay_only/ \
-  --image 1_26.png
+  --image 035.png --overlay-only --color-weight 0.9 \
+  --background-weight 0.5
 ```
 
 ### 获取参数量和FPS

@@ -7,6 +7,8 @@
     python comparison.py --cfg experiments/infrared_images/stdc1_seg.yaml
     python comparison.py --cfg <yaml> EVAL.MODEL_FILE <path_to_pth>
     python comparison.py --overlay-only
+    python comparison.py --overlay-only --color-weight 0.7 --background-weight 0.6
+    python comparison.py --input-dir <images> --mask-dir <masks> --overlay-only
     python comparison.py --input-dir path/to/images --output-dir path/to/results
     python comparison.py --input-dir path/to/images --image example.png
     python comparison.py --overlay-only --image example.png
@@ -109,12 +111,18 @@ def denormalize(img_t, mean, std):
     return img.transpose(1, 2, 0)
 
 
-def overlay(img_rgb, color_mask, alpha=0.5):
-    """原图与彩色 mask 叠加. img_rgb/color_mask: [H,W,3] uint8"""
+def overlay(img_rgb, color_mask, alpha=0.5, foreground_mask=None,
+            background_weight=1.0):
+    """叠加彩色 mask，并可调节背景 RGB 强度。"""
     img_f = img_rgb.astype(np.float32)
     mask_f = color_mask.astype(np.float32)
     out = (1 - alpha) * img_f + alpha * mask_f
-    return np.clip(out, 0, 255).astype(np.uint8)
+    out = np.clip(out, 0, 255).astype(np.uint8)
+    if foreground_mask is not None:
+        background = np.clip(
+            background_weight * img_f, 0, 255).astype(np.uint8)
+        out[~foreground_mask] = background[~foreground_mask]
+    return out
 
 
 def normalize_image_names(images):
@@ -152,7 +160,58 @@ def select_image_indices(dataset, images):
     return [idx for name in requested for idx in indices_by_name[name]]
 
 
-def make_comparison(cfg, overlay_only=False, images=None, input_dir=None, output_dir=None):
+def index_mask_files(mask_dir):
+    """按不带扩展名的文件名索引预测 mask。"""
+    mask_dir = osp.abspath(osp.expanduser(mask_dir))
+    if not osp.isdir(mask_dir):
+        raise ValueError('mask 目录不存在或不是目录: {}'.format(mask_dir))
+
+    mask_paths = {}
+    for entry in sorted(os.scandir(mask_dir), key=lambda item: item.name):
+        if not entry.is_file():
+            continue
+        name, extension = osp.splitext(entry.name)
+        if extension.lower() not in IMAGE_EXTENSIONS:
+            continue
+        if name in mask_paths:
+            raise ValueError('mask 目录中存在同名文件: {}'.format(name))
+        mask_paths[name] = entry.path
+    if not mask_paths:
+        raise ValueError('mask 目录中没有支持的图片: {}'.format(mask_dir))
+    return mask_paths
+
+
+def load_prediction_mask(mask_path, image_size):
+    """读取类别 ID mask 或 COLOR_LIST 彩色 mask，并缩放到原图尺寸。"""
+    with Image.open(mask_path) as mask_img:
+        if mask_img.size != image_size:
+            mask_img = mask_img.resize(image_size, Image.NEAREST)
+
+        if mask_img.mode in ('1', 'L', 'I', 'I;16', 'P'):
+            pred = np.array(mask_img, dtype=np.int64)
+        else:
+            mask_rgb = np.array(mask_img.convert('RGB'))
+            pred = np.full(mask_rgb.shape[:2], -1, dtype=np.int16)
+            for class_id, color in enumerate(InfraredImages.COLOR_LIST):
+                pred[np.all(mask_rgb == color, axis=2)] = class_id
+            unknown_count = int(np.count_nonzero(pred < 0))
+            if unknown_count:
+                raise ValueError(
+                    '彩色 mask {} 中有 {} 个像素不属于 COLOR_LIST'.format(
+                        mask_path, unknown_count))
+
+    if pred.ndim != 2:
+        raise ValueError('mask 必须是单通道类别图或 RGB 彩色类别图: {}'.format(mask_path))
+    if pred.size and (pred.min() < 0 or pred.max() >= len(InfraredImages.COLOR_LIST)):
+        raise ValueError(
+            'mask 类别值必须在 0 到 {} 之间: {}'.format(
+                len(InfraredImages.COLOR_LIST) - 1, mask_path))
+    return pred.astype(np.uint8)
+
+
+def make_comparison(cfg, overlay_only=False, images=None, input_dir=None,
+                    output_dir=None, color_weight=0.5, mask_dir=None,
+                    background_weight=1.0):
     logger = logging.getLogger()
     logger.info('=' * 20)
     logger.info('generating comparison images ...')
@@ -178,6 +237,40 @@ def make_comparison(cfg, overlay_only=False, images=None, input_dir=None, output
         logger.info('selected %d image(s): %s', len(selected_indices),
                     ', '.join(dsval.names[idx] for idx in selected_indices))
 
+    if mask_dir:
+        mask_paths = index_mask_files(mask_dir)
+        missing = [dsval.names[idx] for idx in selected_indices
+                   if dsval.names[idx] not in mask_paths]
+        if missing:
+            raise ValueError('找不到对应的预测 mask: {}'.format(', '.join(missing)))
+
+        sv_dir = (osp.abspath(osp.expanduser(output_dir)) if output_dir else
+                  osp.join(cfg.OUTPUT_DIR, cfg.DATASET.DATASET,
+                           'comparison_images'))
+        os.makedirs(sv_dir, exist_ok=True)
+        logger.info('loading existing masks from: %s',
+                    osp.abspath(osp.expanduser(mask_dir)))
+        logger.info('skipping model loading and inference')
+        logger.info('overlay color weight: %.2f; background weight: %.2f',
+                    color_weight, background_weight)
+        logger.info('saving overlay images to: %s', sv_dir)
+
+        for idx in tqdm(selected_indices, desc='overlay'):
+            name = dsval.names[idx]
+            with Image.open(dsval.imgs[idx]) as orig_img:
+                img_rgb = np.array(orig_img.convert('RGB'))
+            image_size = (img_rgb.shape[1], img_rgb.shape[0])
+            pred = load_prediction_mask(mask_paths[name], image_size)
+            pred_color = dsval.label2color(pred)
+            overlaid = overlay(img_rgb, pred_color, alpha=color_weight,
+                               foreground_mask=(pred != 0),
+                               background_weight=background_weight)
+            Image.fromarray(overlaid).save(osp.join(sv_dir, name + '.png'))
+
+        logger.info('done. %d overlay image(s) saved to %s',
+                    len(selected_indices), sv_dir)
+        return
+
     n_classes = cfg.DATASET.NUM_CLASSES
     net = BiSeNet(backbone=cfg.MODEL.BACKBONE, n_classes=n_classes,
                   use_boundary_2=cfg.MODEL.USE_BOUNDARY_2,
@@ -186,14 +279,21 @@ def make_comparison(cfg, overlay_only=False, images=None, input_dir=None, output
                   use_boundary_16=cfg.MODEL.USE_BOUNDARY_16,
                   use_conv_last=cfg.MODEL.USE_CONV_LAST,
                   use_ema=cfg.MODEL.USE_EMA)
-    net.load_state_dict(torch.load(cfg.EVAL.MODEL_FILE), strict=False)
-    net.cuda()
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if device.type == 'cpu':
+        logger.warning('CUDA is unavailable; falling back to CPU inference')
+    checkpoint = torch.load(cfg.EVAL.MODEL_FILE, map_location=device)
+    net.load_state_dict(checkpoint, strict=False)
+    net.to(device)
     net.eval()
 
     sv_dir = (osp.abspath(osp.expanduser(output_dir)) if output_dir else
               osp.join(cfg.OUTPUT_DIR, cfg.DATASET.DATASET, 'comparison_images'))
     os.makedirs(sv_dir, exist_ok=True)
     logger.info('saving comparison images to: %s', sv_dir)
+    if overlay_only:
+        logger.info('overlay color weight: %.2f; background weight: %.2f',
+                    color_weight, background_weight)
 
     mean = cfg.DATASET.MEAN
     std = cfg.DATASET.STD
@@ -204,10 +304,10 @@ def make_comparison(cfg, overlay_only=False, images=None, input_dir=None, output
         for batch_idx, (imgs, label) in enumerate(tqdm(dl, desc='comparison')):
             idx = selected_indices[batch_idx]
             name = dsval.names[idx]
-            label = label.squeeze(1).cuda()
+            label = label.squeeze(1).to(device)
             size = label.size()[-2:]  # [H, W] (cropsize)
 
-            imgs = imgs.cuda()
+            imgs = imgs.to(device)
             N, C, H, W = imgs.size()
             new_hw = [int(H * scale), int(W * scale)]
             in_imgs = F.interpolate(imgs, new_hw, mode='bilinear',
@@ -235,7 +335,13 @@ def make_comparison(cfg, overlay_only=False, images=None, input_dir=None, output
             if not overlay_only:
                 lb_color = dsval.label2color(lb_np)
             pred_color = dsval.label2color(pred)
-            overlaid = overlay(img_rgb, pred_color, alpha=0.5)
+            if overlay_only:
+                # 0 类是背景：仅给非背景预测区域着色，背景保留原图像素。
+                overlaid = overlay(img_rgb, pred_color, alpha=color_weight,
+                                   foreground_mask=(pred != 0),
+                                   background_weight=background_weight)
+            else:
+                overlaid = overlay(img_rgb, pred_color, alpha=0.5)
 
             out_path = osp.join(sv_dir, name + '.png')
             if overlay_only:
@@ -266,8 +372,19 @@ def parse_args():
                        help='experiment configure file name')
     parse.add_argument('--overlay-only', action='store_true',
                        help='save only the prediction overlay at the original resolution')
+    parse.add_argument('--color-weight', type=float, default=0.5,
+                       metavar='WEIGHT',
+                       help=('mask color weight in overlay-only mode, in the '
+                             'range [0, 1] (default: 0.5)'))
+    parse.add_argument('--background-weight', type=float, default=1.0,
+                       metavar='WEIGHT',
+                       help=('background RGB intensity in overlay-only mode, '
+                             'in the range [0, 1] (default: 1.0)'))
     parse.add_argument('--input-dir', type=str,
                        help='read input images from this directory')
+    parse.add_argument('--mask-dir', type=str,
+                       help=('load existing class-ID or colored prediction masks '
+                             'from this directory and skip model inference'))
     parse.add_argument('--output-dir', type=str,
                        help='save generated images directly to this directory')
     parse.add_argument('--image', '--images', dest='images', action='append',
@@ -277,6 +394,10 @@ def parse_args():
     parse.add_argument('opts', help='Modify config options using the command-line',
                        default=None, nargs=argparse.REMAINDER)
     args = parse.parse_args()
+    if not 0.0 <= args.color_weight <= 1.0:
+        parse.error('--color-weight must be between 0 and 1')
+    if not 0.0 <= args.background_weight <= 1.0:
+        parse.error('--background-weight must be between 0 and 1')
     update_config(config, args)
     return args
 
@@ -291,4 +412,7 @@ if __name__ == '__main__':
                     overlay_only=args.overlay_only,
                     images=args.images,
                     input_dir=args.input_dir,
-                    output_dir=args.output_dir)
+                    output_dir=args.output_dir,
+                    color_weight=args.color_weight,
+                    mask_dir=args.mask_dir,
+                    background_weight=args.background_weight)
